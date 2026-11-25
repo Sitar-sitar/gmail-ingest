@@ -1,0 +1,18 @@
+# 認証情報・個人データ・実行状態・ログ（Git管理外）
+/data/
+/state/
+/logs/
+
+# 依存
+/node_modules/
+
+# 秘密情報の保険（親リポの方針に合わせる）
+*.pem
+*.key
+*secret*
+*credential*
+oauth.json
+
+# 一時
+/.tmp/
+*.log
