@@ -64,9 +64,10 @@ switch ($Stage) {
     'Snapshot' {
         Assert-ExpectedStage 'old-drained'
         Assert-TaskDisabled
-        $legacy = if (-not $ProfilePath) { @('--include-legacy-state') } else { @() }
-        $result = & $NodePath (Join-Path $root 'run.mjs') @runnerArgs --restore-set @legacy | ConvertFrom-Json
-        if ($LASTEXITCODE -ne 0 -or -not $result.data.generation) { throw 'A verified restore set was not created.' }
+        $snapshotArgs = @($runnerArgs) + '--restore-set'
+        if (-not $ProfilePath) { $snapshotArgs += '--include-legacy-state' }
+        $result = & $NodePath (Join-Path $root 'run.mjs') @snapshotArgs | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 0 -or -not $result.data.generation) { throw "A verified restore set was not created (runner exit $LASTEXITCODE)." }
         Save-Stage 'snapshot-verified' $result.data.generation
     }
     'ConfirmFirstRun' {

@@ -242,6 +242,7 @@ export async function run(args, { now = () => new Date(), spawnStep = runNodeSte
         retries++;
       }
       const code = classifyExit(result);
+      const combinedAmazon = job === 'amazon' && !options.idsOnly;
       for (const provider of options.idsOnly ? [] : pending) {
         const prior = targetState(state, job, provider).confirmed_through;
         if (code !== 3) {
@@ -251,9 +252,12 @@ export async function run(args, { now = () => new Date(), spawnStep = runNodeSte
         const next = targetState(state, job, provider);
         entries.push({ job, provider, step: 'verify', retries, outcome: result.outcome, code: result.code,
           http_status: result.httpStatus, failure_id: next.failure?.failure_id,
-          confirmed_before: prior, confirmed_after: next.confirmed_through, counts: result.counts });
+          confirmed_before: prior, confirmed_after: next.confirmed_through, counts: combinedAmazon ? undefined : result.counts });
       }
-      if (options.idsOnly) entries.push({ job, step: 'fetch', retries, outcome: result.outcome, code: result.code, counts: result.counts });
+      if (options.idsOnly || (combinedAmazon && result.counts)) {
+        entries.push({ job, step: options.idsOnly ? 'fetch' : 'verify', retries,
+          outcome: result.outcome, code: result.code, counts: result.counts });
+      }
       if (code === 3) return 3;
       if (!options.idsOnly) {
         saveState(stateFile, state);

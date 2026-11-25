@@ -132,6 +132,19 @@ test('diagnostic values and arbitrary properties are not persisted', (t) => {
   assert.equal(JSON.parse(readFileSync(path.join(dir, 'summary.json'), 'utf8')).entries[0].counts.candidates, 1);
 });
 
+test('Amazon records each type’s outcome and the shared import counts once', async (t) => {
+  const fixture = profileFixture(t);
+  const { spawnStep } = syntheticSteps(fixture);
+  assert.equal((await run(['--profile', fixture.profile, '--job', 'amazon'], { now: () => time, spawnStep })).exitCode, 0);
+  const summary = JSON.parse(readFileSync(path.join(fixture.roots.runner, 'logs', 'summary.json'), 'utf8'));
+  const entries = summary.entries.filter((entry) => entry.job === 'amazon' && entry.step === 'verify');
+  assert.deepEqual(entries.filter((entry) => entry.provider).map((entry) => [entry.provider, entry.outcome, entry.counts]),
+    [['type_a', 'success', {}], ['type_b', 'success', {}]]);
+  const counted = entries.filter((entry) => Object.hasOwn(entry.counts, 'inserted'));
+  assert.equal(counted.length, 1);
+  assert.equal(counted[0].provider, undefined);
+});
+
 test('cleanup approval is single-use and changed, unverified and protected files survive', (t) => {
   const { roots, stateDir, ordersCsv } = profileFixture(t);
   const folder = path.join(roots.amazon, 'data', 'gmail-staging', 'amazon', 'run');
