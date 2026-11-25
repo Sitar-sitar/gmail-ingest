@@ -7,7 +7,7 @@
 - **種別**: 修正設計書
 - **対象バージョン**: `gmail-ingest` v0.1.0 / `amazon-tracker` v0.2.0 / `credit-card-tracker` v0.1.2 を修正の基準とする。反映版の番号は実装時に決める。
 - **前提コミット**: `gmail-ingest` `839c85c` / `amazon-tracker` `442b424` / `credit-card-tracker` `587d0d9` / 親リポ `7c69e0a`
-- **ステータス**: 一部実施（2026-11-26 に §5.2 の短期対応と §5.5 の台帳・テスト入口を反映。残りは着手前）。**F #27 の一括削除は方式 A（過去分の一括削除を設ける）に決定**（ユーザー判断 2026-11-26）。実装着手には Phase 1 §10-10 の取得元識別策の決定が先行条件（§5.1 / §5.1-1）。
+- **ステータス**: 一部実施（2026-11-26 に §5.2 の短期対応と §5.5 を反映）。**残る4件（P1-01 / P2-01 恒久対応 / P2-02 / P3-01）は §5.1-2・§5.2-1・§5.3-1・§5.4-1 に実装仕様まで確定し、着手前**。**F #27 の一括削除は方式 A（過去分の一括削除を設ける）に決定**（ユーザー判断 2026-11-26）。実装着手には Phase 1 §10-10 の取得元識別策の決定が先行条件（§5.1 / §5.1-1）。
 - **関連**: [2026-11-26 実装レビュー](実装レビュー_Gmail取り込み非AI一本化_Phase1_2026-11-26.md) / [Phase 1 実装ログ](実装ログ.md)
 
 ## 1. 目的・背景
@@ -92,6 +92,46 @@
 - `state/verified-artifacts.json` は遡及して書き換えない。定常の自動削除は引き続き照合済み台帳だけを見る（§4.6-1 の 2 系統は独立のまま）。
 - 定常ログには件数だけを出す（`removed` / `retained` に加えて `removed_legacy`）。証跡台帳のパス・`ref`・`policy_id` は定常ログに書かない（§4.7）。
 
+#### 5.1-2 方式 A の実装仕様（2026-11-26 追記）
+
+§5.1-1 の契約を現行コードへ落とす。**過去分の適格性は計画作成時には決められない**（証跡台帳は計画の同一性フィールドを書き写して人が後から作る）。そのため適格判定は**承認時**に行い、**実行直前に同じ条件で再検証**する。計画生成（`createCleanupPlan`）は変更しない。
+
+**引数と出力検査**
+
+- `optionsFrom` に `'include-legacy': { type: 'boolean' }` を追加し、`mode === 'approve'` 以外での指定は `INVALID_MODE`（終了コード1）とする。既存の `--include-legacy-state` は `--restore-set` 専用のまま。名前が近いため、両者の可否判定は 1 箇所にまとめて書く。
+- `validateOutputs` のリダイレクト検査対象へ `state/cleanup-evidence.json` と `state/origin-policy.json` を加える（§4.6-2a と同じ扱い）。
+- `approveCleanup(stateDir, roots, planId, at, { includeLegacy })` と `executeCleanup(stateDir, roots, planId, at)` に拡張し、`run.mjs` の呼び出し 2 箇所を合わせる。実行側は承認ファイルの範囲を読むだけで、フラグを受け取らない。
+
+**ファイル形式**
+
+- 承認ファイル `state/cleanup-enabled`: `{ plan_id, approved_at, scope }`。`scope` は `verified` または `verified+legacy`。後者のときだけ `legacy: { origin_policy_id, evidence_sha256, paths: [...] }` を持つ。`evidence_sha256` は証跡台帳のバイト列の SHA-256、`paths` は承認時に全検査を通った対象の実パス。
+- 証跡台帳 `state/cleanup-evidence.json`: `{ origin_policy_id, created_at, items: [...] }`。`items` の 1 要素は `{ root, path, kind, size, mtime, sha256, origin_released, applied_proof: { kind, ref } }`。前 6 項目は計画の同一性フィールドの書き写し。
+
+**承認時の検証（1 項目でも不合格ならその項目を承認に含めない）**
+
+1. `loadPlan` で計画を読み、`scope` が `verified` なら従来の承認をそのまま作る。
+2. `verified+legacy` では、台帳の `origin_policy_id` が `state/origin-policy.json` の `policy_id` と一致することを先に確認する。**`origin-policy.json` が無い、または不一致なら過去分を 1 件も承認しない**（§5.1-1 の検証3）。
+3. 各 item が計画の entry と `root` / `path` / `kind` / `size` / `mtime` / `sha256` で一致し、その entry が `verified === false`（照合済みは従来経路の対象）であること。
+4. `origin_released === true`、`applied_proof.kind` が §5.1-1 の表の 3 値、`ref` が `^[A-Za-z0-9._-]{1,120}$`、参照先が表のとおり実在すること。
+5. 保持期限（§4.6-1。過去分は `mtime` を起点とする）を超え、保全対象でないこと。
+6. すべて通った対象が 1 件も無ければ承認ファイルを作らず `INVALID_CLEANUP_EVIDENCE` とする（終了コード1。状態と業務データは変更しない）。
+
+**実行時の再検証**
+
+承認の `plan_id` 一致を確認して承認ファイルを `.consumed` へ改名する既存手順は変えない。過去分はさらに、台帳を読み直して `evidence_sha256` が一致すること、`paths` に含まれること、承認時の 3〜5 を同じ条件で再実行することを求める。**承認に無いパスは過去分として削除しない。** 差し替え・新規出現は保持する。
+
+**保全対象の二重化**
+
+`kindFor` が種別を返さないファイルは計画に入らないため既に対象外だが、過去分は人が書いた台帳を入力に取るため、削除直前に無条件保持の判定を別に置く。`kind === 'isolation'`、`parse_failure === true`、および `public/data/orders.csv` / `dist/data/orders.csv` / `*.db` / `*.db-wal` / `*.db-shm` / `gmail-import-rules.md` / `backups/orders/` 直下の CSV / `state/restore-sets/` 配下に当たるものを保持する。
+
+**`card_import_run` の照合手段**
+
+ランナーは追加依存を持たない方針のため、標準モジュール `node:sqlite` の `DatabaseSync` を `{ readOnly: true }` で開き、`SELECT` だけを実行する。WAL / SHM には触らない。読むのは当該 ID の行の存在、`note`（旧行は `failure_count`）、provider、期間に限り、取引明細は読まない。`node:sqlite` は Node 22.5 で入ったため、`package.json` の `engines.node` を `>=20` から `>=22.5` へ引き上げる（運用環境は Node 24）。
+
+**件数と消費**
+
+`executeCleanup` の戻り値を `{ removed, retained, removed_legacy }` に拡張し、`run.mjs` はそのまま `data` として返す。定常ログに出すのはこの 3 件数だけで、パス・`ref`・`policy_id` は出さない（§4.7）。消費時は承認ファイル・計画台帳に加えて `state/cleanup-evidence.json` も削除し、`state/verified-artifacts.json` は触らない。
+
 ### 5.2 Amazon の確定失敗の解除と型別スキップ（P2-01）
 
 - 短期は `README.md` の失敗復旧手順に Phase 1 §4.5-2 を転記する。両型に未承認の失敗 ID が残る場合は、原因を確認して型ごとの ID で `node run.mjs --clear-failure <failure_id> --job amazon` を実行する。ID はその型と失敗区間だけを承認し、解除操作は確認済み期間を変更しない。
@@ -100,15 +140,65 @@
 - スキップした型の状態・確認済み期間・承認は保持する。選択型に限り実行開始時にその失敗の承認を一回消費し、適用確認に成功した型の期間を確定する。適用前の確定失敗を型に帰属できる場合は適用を見送り、当該型に失敗を記録する。他の選択型は未適用として記録し、確認済み期間を据え置く。共通 CSV の適用・事後検証など帰属不能な確定失敗は参加した全型に記録する。
 - 実行対象のすべてが未承認でスキップされた場合のみ終了コード5。結果の集約は既存の終了コード契約を継承し、予定していた型をスキップした週次枠は未完了のまま保持する。
 
+#### 5.2-1 型別スキップの実装仕様（2026-11-26 追記）
+
+**ランナー側**
+
+- `listJobs` は変更しない（Amazon は共通 CSV へ適用する 1 ジョブのまま、`targets` に両型を持つ）。
+- `run.mjs` の実行対象の選別を差し替える。ジョブごとに `blocked`（未承認 `permanent`）を求め、`runnable = targets.filter((t) => ranges[t] && !blocked.includes(t))` を spec に持たせ、**`runnable.length > 0` のジョブを実行対象にする**。blocked の型には現行どおり `skipped: true` のエントリを残す。以降の `pending` を使う処理（承認の消費、状態記録、ログ）は `runnable` を使う。
+- 終了コード5 の条件式（`jobs.length && !available.length`）は変えない。全ジョブの `runnable` が 0 のときだけ 5 になる。
+- 週次枠の確定条件を `resultCode === 0 && available.length === jobs.length` から **`resultCode === 0 && 見送った対象が 0 件`** へ変える。型を 1 つでも見送った回の枠は未完了のまま残す。
+- `executeAmazon` は選択型を受け取り、`--types <カンマ区切り>` を子 CLI へ渡す。状態側の `type_a` / `type_b` を CLI の `typeA` / `typeB` へ写す。`rangeStart()` の当日フォールバックは**選択型の検索下限を決めるためだけ**に使い、選択型の決定には関与させない。
+- `verifyAmazonSource(candidates, sources, selected)` はループを選択型に限る。非選択型については、`candidates` に `<type>_query` と `<type>_message_count` が無いこと、`rows` に当該型が無いこと、`<type>-ids.json` と `<type>-messages.jsonl` が出力ディレクトリに存在しないことを検査する。
+
+**Amazon CLI（`tools/gmail-fetch-local.mjs`）**
+
+- `--types` を追加する。値を分解して空要素を除き、許可値は `typeA` / `typeB`。**未知値・空集合・重複は Gmail アクセス前に例外で終了**する（終了コード1。`--ingest-status` 付きなら `{status:"error"}`）。省略時は従来どおり両型。`--ids-only` との併用は拒否し、検索専用モードは既存の両型契約を継承する。
+- 非選択型は `searchIds` も `fetchMessages` も呼ばず、`<type>-ids.json` を書かない。`buildCandidates` には選択型のメッセージだけを渡し、生成物のキーも選択型だけにする。`candidateIssues` の検査も選択型だけを見る。`selected_types` を候補 JSON と標準出力 JSON の両方へ出す。
+
+**状態・承認・失敗の帰属**
+
+- 承認の 1 回消費（`consumeFailureApproval`）は選択型だけに適用する。スキップした型の `last_outcome`・`confirmed_through`・承認は保持する。
+- 適用確認に成功した型だけ `confirmed_through` を進める。型に帰属できる取得・解析失敗は当該型だけに記録し、他の選択型は `not_run` として期間を据え置く。共通 CSV の適用・事後照合に由来する確定失敗は、参加した全選択型に記録する。
+
 ### 5.3 共有ロックの契約テスト（P2-02）
 
 `lib/lock.mjs`、`amazon-tracker/tools/gmail-import-run.mjs`、`credit-card-tracker/tools/gmail-import-apply.mjs` の各リポジトリに、ローカルの自ファイルだけを読む契約テストを追加する。改行を LF に正規化し、`// Keep the on-disk contract identical in direct import entry points.` から `joinImportLock` の末尾までを抽出する。抽出の終端はランナーがファイル末尾、両アプリは後続の `const ROOT = process.cwd();` の直前とし、末尾の空行を一つの改行へ正規化する。開始・終端の欠落や重複はテスト失敗とする。
 
 前提コミットで実測した UTF-8 の正規化後 SHA-256 は `992f0a21709e1bee3348f442faf7861072788800ddbffa94ef50ba3e3707500f`。3つのテストが同じ固定値を参照する。契約を更新する場合は3リポジトリの対象コミットと期待値を同じリリース作業で突き合わせ、片側だけを本番配備しない。ハッシュ比較に加え、既存の排他・所有者・回収の動作試験を通す。
 
+#### 5.3-1 契約テストの実装仕様（2026-11-26 追記）
+
+**抽出アルゴリズム（3 リポジトリで同一）**
+
+1. UTF-8 で読み、`\r\n` を `\n` へ正規化する。
+2. 開始は `// Keep the on-disk contract identical in direct import entry points.` の先頭。この行が無い、または 2 回以上現れる場合はテスト失敗。
+3. 終端はランナーがファイル末尾、両アプリは開始位置以降で最初に現れる `const ROOT = process.cwd();` の直前。アプリ側で見つからない場合はテスト失敗。
+4. 末尾の改行を落として改行 1 つを付す。
+
+**期待値**
+
+SHA-256 は `992f0a21709e1bee3348f442faf7861072788800ddbffa94ef50ba3e3707500f`、長さは 5115 バイト。**2026-11-26 に 3 コピーで再実測し、3 つとも一致することを確認した。** 長さもハッシュと併せて検査する。
+
+**配置**
+
+`gmail-ingest/tests/lock-contract.test.mjs`、`amazon-tracker/tests/lock-contract.test.mjs`、`credit-card-tracker/tests/lock-contract.test.mjs`。各テストは**自リポジトリのファイルだけ**を読み、他リポジトリを参照しない。カードは `test:automation` の連結へ加え、§5.5 の `npm test` から到達させる。あわせて `gmail-ingest/tests/state-lock.test.mjs` に、所有者以外の解除拒否・子生存中の保持・`pending_human_review` の保持が揃っているかを確認し、欠けていれば追加する。契約を変える場合は 3 リポジトリの対象コミットと期待値を同一のリリース作業で更新する。
+
 ### 5.4 Amazon の独立照合の保守（P3-01）
 
 `gmail-import-rules.md` に、Gmail 書式変更時は Amazon のパーサと `lib/verify.mjs` の両方を確認する運用を記載する。照合は引き続き元の本文から再計算する。Type A の複数商品・数量・割引・注文総額、Type B の明細と予約除外について、同じ合成メールでパーサと照合器を通す。意図的に改変した候補を照合器が拒否する試験も加える。
+
+#### 5.4-1 独立照合の保守の実装仕様（2026-11-26 追記）
+
+**運用メモ（`amazon-tracker/gmail-import-rules.md`）**
+
+パースルール節へ 1 行置く。「メール書式の変更を取り込むときは、このファイルのパースルールと `gmail-ingest/lib/verify.mjs` の照合器を同じ変更で確認する。片方だけ直すと、取得が成功した週に照合が `permanent` で止まる。」
+
+**突き合わせ回帰**
+
+ランナーのテストは他リポジトリを import しない方針（既存のテストは合成プロファイルと差し替えた子スクリプトで実 CLI を模す）。そのため合成メールと期待行の対を固定フィクスチャ `tests/fixtures/amazon-mail-contract.json` として**2 リポジトリへ同一内容で置き**、ランナー側は照合器、Amazon 側はパーサ（`parseTypeA` / `parseTypeB`）へ通して、同じ期待行になることを確認する。フィクスチャ自体も SHA-256 を固定し、両コピーの一致を §5.3-1 と同じ方式で検査する。
+
+内容には Type A の複数商品・数量・割引・注文総額、Type B の明細と予約除外を含める。あわせて、数量・金額・予約扱いを改変した候補を照合器が拒否する試験を加える。
 
 ### 5.5 台帳とテスト入口（P3-04）
 
@@ -127,10 +217,10 @@
 | 順 | 変更対象 | 検証 |
 |---|---|---|
 | 1 | `gmail-ingest/README.md`（**2026-11-26 実施**） | 現行版で Amazon の両 ID が必要な場合の復旧手順を照合。`README.md` の「確定失敗の解除」に型ごとの `failure_id` と未承認 ID それぞれへの `--clear-failure` を記載。 |
-| 2 | 3リポジトリの `tests/` と既存のテスト入口 | §5.3 の一致を確認し、1コピーの変更だけで対応テストが落ちることを確認。 |
-| 3 | `run.mjs`、`jobs.mjs`、`lib/verify.mjs`、Amazon `tools/gmail-fetch-local.mjs` と各回帰テスト、`gmail-import-rules.md` | 型別スキップ・確定期間・共有 CSV の整合・元メール独立照合を隔離検証。 |
+| 2 | 3リポジトリの `tests/lock-contract.test.mjs` と既存のテスト入口（§5.3-1） | §5.3 の一致を確認し、1コピーの変更だけで対応テストが落ちることを確認。長さとハッシュの両方を検査。 |
+| 3 | `run.mjs`、`jobs.mjs`、`lib/verify.mjs`、Amazon `tools/gmail-fetch-local.mjs` と各回帰テスト、`gmail-import-rules.md`、両リポジトリの `tests/fixtures/amazon-mail-contract.json`（§5.2-1 / §5.4-1） | 型別スキップ・確定期間・共有 CSV の整合・元メール独立照合を隔離検証。 |
 | 4 | カード `package.json`、親 `PROJECT_OVERVIEW.md`、関連ドキュメント（**2026-11-26 実施**） | 3スイートが集約入口から通ることと台帳・旧履歴を照合。`npm test` で `test:parser` → `test:import` → `test:automation` が順に実行され終了コード0。親台帳の初期化メモを初回コミット・リモート作成済みへ修正。 |
-| 5 | §10-10 の決定後に `lib/cleanup.mjs`（証跡台帳の読み取りと検証、承認範囲の記録と消費）、`run.mjs`（`--include-legacy`）、テスト、`README.md`、Phase 1 §4.6 | §5.1-1 の証跡・保持・承認契約を隔離受入。証跡なし・参照先欠落・範囲外・同一性不一致・保全対象が 1 件も削除されないことを確認。 |
+| 5 | §10-10 の決定後に `lib/cleanup.mjs`（証跡台帳の読み取りと検証、承認範囲の記録と消費）、`run.mjs`（`--include-legacy` と出力検査）、`package.json`（`engines.node` を `>=22.5` へ）、テスト、`README.md`、Phase 1 §4.6（§5.1-2） | §5.1-1 の証跡・保持・承認契約を隔離受入。証跡なし・参照先欠落・範囲外・同一性不一致・保全対象が 1 件も削除されないことを確認。 |
 
 ## 8. テスト・検証
 
@@ -150,6 +240,11 @@
 - 同版の3コピーで排他テストが成立し、ロック実装の片側変更を配備前に検出できる。
 - F #27 の保留中は両フラグが未配置で、元データの削除件数は0。再開する場合は方式 A の受入（§8）を満たし、対象と保全の根拠を実行前に確認できる。
 - **§10-10 の決定記録がない状態では、証跡台帳があっても過去分の削除件数が 0 である。**
+- `--include-legacy` は承認モード以外で拒否され、`--include-legacy-state` と取り違えた指定も終了コード1で止まる。承認が作られなかった回は状態と業務データが変わらない。
+- 過去分は承認時と実行直前の両方で同じ条件を検査し、承認後に差し替えられた項目・承認に無い項目は削除されない。
+- 型を1つ見送った回は週次枠を未完了に保ち、残る選択型の確認済み期間だけが進む。スキップした型の承認は消費されない。
+- 3リポジトリのロック契約テストが同じ固定値と長さで成立し、1コピーの改変で当該リポジトリのテストだけが落ちる。
+- パーサと照合器の突き合わせ回帰が両リポジトリで成立し、フィクスチャのコピー間差異を検出できる。
 - 過去分の削除は `--include-legacy` を付けた承認の範囲内に限られ、実行側のフラグでは範囲が広がらない。承認の消費後に証跡台帳・計画台帳が残らず、定常の自動削除は照合済み台帳だけを対象とし続ける。
 
 ## 10. リスク・ロールバック
@@ -166,6 +261,7 @@
 
 | 日付 | 内容 |
 |---|---|
+| 2026-11-26 | 修正待ち4件を実装できる粒度まで確定。§5.1-2（方式 A の実装仕様。適格判定は承認時、実行直前に再検証。承認ファイルと証跡台帳の形、`node:sqlite` の読み取り専用照合、`engines.node` の引き上げ、保全対象の二重化、`removed_legacy`）、§5.2-1（`runnable` による型別選別、週次枠の確定条件の変更、`--types` の受け渡しと拒否条件、非選択型の不存在検査）、§5.3-1（抽出アルゴリズムと期待値 5115 バイト／`992f0a21…` を3コピーで再実測、テスト配置）、§5.4-1（運用メモの文面、2リポジトリ同一フィクスチャ方式）を新設し、§7 実装順・§9 受入条件を同期。 |
 | 2026-11-26 | Amazon 旧履歴の扱いを決定し §5.5 の残り1件を実施。追記4件は切替前の実行でバックアップが現存するため履歴として保持し、最終取り込み状況を切替時点で確定・以後更新しないことを `gmail-import-rules.md` へ明記した（`d7bcd8f`）。これで P3-04 は全件完了。 |
 | 2026-11-26 | §5.2 の短期対応（`README.md` の確定失敗の解除手順）と §5.5 の2件（親 `PROJECT_OVERVIEW.md` の初期化メモ、カードの `npm test` 集約）を実施し、§7 実装順1・4 に実施済みを注記。ステータスを「一部実施」へ変更。Amazon 旧履歴の扱いは所有者の判断待ちで保留。 |
 | 2026-11-26 | **F #27 の一括削除方式をユーザー判断で A（過去分の一括削除を設ける）に決定**し、A が求める証跡の入力形式・供給元・検証・承認範囲・消費を §5.1-1 として確定。受入条件と実装順 #5、試験項目（証跡台帳）も同期した。§10-10 の決定記録が揃うまでは過去分の削除件数が 0 になることを受入に明記。 |
