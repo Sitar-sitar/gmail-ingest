@@ -35,7 +35,8 @@ test('bounded gap and Sunday slot follow JST boundaries', () => {
   const interval = cardRange('2026-09-25', '2026-01-01', '2026-11-25');
   assert.deepEqual(interval, { from: '2026-09-26', to: '2026-11-09', recovery: true, hasMore: true });
   assert.equal(cardRange('', '2026-01-01', '2026-11-25').recovery, true);
-  assert.equal(cardRange('2026-11-21', '2026-01-01', '2026-11-25', true), null);
+  assert.deepEqual(cardRange('2026-11-21', '2026-01-01', '2026-11-25', true),
+    { from: '2026-11-22', to: '2026-11-24', recovery: true, hasMore: false });
   assert.deepEqual(cardRange('2026-11-09', '2026-01-01', '2026-11-25', true, true),
     { from: '2026-11-10', to: '2026-11-24', recovery: true, hasMore: false });
   assert.equal(latestSlot(new Date('2026-11-22T12:59:59Z')), '2026-11-15');

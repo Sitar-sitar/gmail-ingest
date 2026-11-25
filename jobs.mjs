@@ -47,8 +47,7 @@ export function listJobs(state, options, today) {
     for (const type of AMAZON_TYPES) {
       const { confirmed_through: confirmed } = targetState(state, 'amazon', type);
       const from = confirmed ? offsetDay(confirmed, 1) : state.business_from;
-      ranges[type] = (options.gapOnly && confirmed && from >= offsetDay(today, -45)) || from > previous
-        ? null : { from, to: previous };
+      ranges[type] = from > previous ? null : { from, to: previous };
     }
     jobs.push({ job: 'amazon', targets: AMAZON_TYPES, ranges });
   }
