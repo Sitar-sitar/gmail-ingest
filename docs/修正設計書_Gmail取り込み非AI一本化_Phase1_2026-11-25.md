@@ -673,7 +673,7 @@ OAuth のアクセスを取り消した場合、または `gmail-ingest` の運�
 3. **中間ファイル**: 本文 JSONL、`candidates.json`、`typeA-ids.json` / `typeB-ids.json`、**`ids.json`**、**`manifest.json`**、**年月別の過去取得ディレクトリ**（`credit-card-tracker/data/gmail-staging/<YYYY>/<YYYY-MM>/<provider>/`。`tools/gmail-fetch-local.mjs:153–160,184–188`）、`import-<provider>-<tag>.json`、隔離 JSON、`quarantine/gmail-import/`、`parse-failures.json`。
 4. **（業務データに触れる前）公式データの可用性と再構築の試行**（第2回レビュー R2-10 により順序を前倒し）: Amazon 公式 CSV エクスポート由来のデータは Workspace API 経由で取得していないため 2(d) の対象外で、**保持してよい**。公式 CSV から再構築する案 (d) を採る場合は、**この時点で公式エクスポートファイルを読み取り、再構築を試行して成功することを確認する。** 入力が欠損していれば、**独立データを失う前に手順を中止する**。
 5. **（業務データに触れる前）復元セットの作成**: §7-1 の手順で、現時点の CSV・SQLite・state を 1 世代として保存する。**この復元セット自体も失効時の対象台帳に含める**（R2-15。Gmail 由来データを含むため、手順 8 で扱う）。
-6. **業務データ（user data）**: `amazon-tracker/public/data/orders.csv` の Gmail 由来行、`credit-card-tracker` の SQLite。`orders.csv` の Gmail 由来行の識別手段は §10-10 で決める。
+6. **業務データ（user data）**: `amazon-tracker/public/data/orders.csv` の Gmail 由来行、`credit-card-tracker` の SQLite。`orders.csv` の Gmail 由来行の識別手段は **§10-10 を (b) 別の対応表で決定した（2026-11-26）**。対応表 `amazon-tracker/data/gmail-origin.json` と決定記録 `gmail-ingest/state/origin-policy.json` を使う具体手順は [取得元識別の修正設計書](修正設計書_Gmail取得元識別_Phase1_2026-11-26.md) §5.6 を正本とする。
    **SQLite の扱い（R2-10）**:
    - **全体を廃棄できる条件**: 当該 DB に Gmail 由来以外の独立データが**無い**と確認できる場合。`credit-card-tracker` の取引は現状すべて Gmail 由来のため、この条件を満たす見込み（実装時に確認する）。満たす場合は **DB ファイルごと廃棄**し、スキーマだけを作り直すのが最も確実。
    - **混在する場合に削除するテーブル**: `transactions`（Gmail 由来行）、`transaction_sources`、`gmail_fetch_messages`、`parse_failures`、`import_runs`（診断 `note` を含む。§4.7-1）、および `email_messages` **自体**（件名・送信元・メッセージ ID を保持しているため、行削除では足りず**テーブルの内容を全消去する**）。
@@ -1135,7 +1135,9 @@ CLAUDE.md §5 に従い 1 ファイル単位で生成する。各ステップは
 | (c) 特徴から推定 | Gmail 由来は `Billing Address` / `Shipping Address` が空、`Payment Method Type` が `Not Available` 等の特徴で推定 | 確実性がない。公式 CSV 由来でも同様の行があり得る |
 | (d) 区別せず再構築 | 取り消し時は Gmail 由来か不明な行も含めて削除し、Amazon 公式 CSV エクスポートから再構築する | 実装不要で確実だが、Gmail からのみ取得した注文（公式エクスポート最終日 2026-04-25 以降の分）が失われる |
 
-**要判断**: (b) を Phase 1 のスコープに含めるか、Phase 1 では §4.6-3 の手順書に (d) を暫定手順として記載し、(b) を別設計書へ分離するか。取り消しが実際に起きる可能性は低く、Phase 1 の期限（2027-01-31）を圧迫するため、**暫定は (d) を手順書に記載し、(b) は別途起票**を推奨する。
+**要判断 → 決定済み**: **(b) 別の対応表を持つに決定した**（ユーザー判断 2026-11-26）。正本は [取得元識別の修正設計書](修正設計書_Gmail取得元識別_Phase1_2026-11-26.md)（2026-11-26 実装済み。`amazon-tracker` `bcd8e82` / `gmail-ingest` `ba0f01e`）で、本項の「要判断」は同設計書が置き換える。以下の問題記述と選択肢一覧は判断の記録として残す。
+
+（以下は 2026-11-25 起票時の記述）~~(b) を Phase 1 のスコープに含めるか、Phase 1 では §4.6-3 の手順書に (d) を暫定手順として記載し、(b) を別設計書へ分離するか。取り消しが実際に起きる可能性は低く、Phase 1 の期限（2027-01-31）を圧迫するため、**暫定は (d) を手順書に記載し、(b) は別途起票**を推奨する。~~
 
 **F #27 の再開前に取得元識別策を決める。** (b) を採る場合は過去の本文 JSONL と候補 JSON を再構成入力として保全する（§4.6-2 手順 2）。(d) を採る場合は Amazon 公式エクスポートファイルの可用性と再構築を先に確かめる（§4.6-3 手順 4）。取得元識別策の決定後、一括削除方式を決める。
 
