@@ -446,10 +446,13 @@ test('a card payload is released only by a successful import_runs row for its pr
       provider TEXT, query_from_day TEXT, query_to_day TEXT, message_count INTEGER, parsed_count INTEGER,
       inserted_count INTEGER, duplicate_count INTEGER, failure_count INTEGER NOT NULL DEFAULT 0,
       ignored_count INTEGER, note TEXT)`);
-    db.exec(`INSERT INTO import_runs (id, provider, query_from_day, query_to_day, failure_count, note) VALUES
-      (7, 'smbc', '2026-11-01', '2026-11-07', 0, 'success'),
-      (8, 'smbc', '2026-11-01', '2026-11-07', 2, 'failed'),
-      (9, 'rakuten_card', '2026-11-01', '2026-11-07', 0, NULL)`);
+    // 成否の正本は status 列。note は取り込みログのパスを持つ（実データと同じ形にする）。
+    db.exec(`INSERT INTO import_runs (id, provider, query_from_day, query_to_day, failure_count, status, note) VALUES
+      (7, 'smbc', '2026-11-01', '2026-11-07', 0, 'success', 'logs/gmail-import/2026-11-07.md'),
+      (8, 'smbc', '2026-11-01', '2026-11-07', 2, 'needs_review', 'logs/gmail-import/2026-11-07.md'),
+      (9, 'rakuten_card', '2026-11-01', '2026-11-07', 0, 'success', 'logs/gmail-import/2026-11-07.md'),
+      (10, 'smbc', '2026-10-01', '2026-10-31', 0, 'success', 'logs/gmail-import/2026-10-31.md'),
+      (11, 'smbc', '2026-10-05', '2026-10-20', 0, 'success', 'logs/gmail-import/2026-10-20.md')`);
   } finally { db.close(); }
 
   const payload = path.join(roots.card, 'data', 'import-smbc-2026-11-01-to-2026-11-07.json');
@@ -459,17 +462,17 @@ test('a card payload is released only by a successful import_runs row for its pr
   const policy = createHash('sha256').update(JSON.stringify(policyBody)).digest('hex');
   writeFileSync(path.join(stateDir, 'origin-policy.json'), JSON.stringify({ policy_id: policy, ...policyBody }));
 
-  const approveWith = (ref) => {
+  const approveWith = (ref, target = payload, kindExpected = 'payload', proofKind = 'card_import_run') => {
     const { planId } = createCleanupPlan(stateDir, roots, at);
     const plan = JSON.parse(readFileSync(path.join(stateDir, 'cleanup-plans', `${planId}.json`), 'utf8'));
-    const entry = plan.entries.find((candidate) => candidate.path.toLowerCase() === payload.toLowerCase());
-    assert.ok(entry, 'payload is part of the plan');
-    assert.equal(entry.kind, 'payload');
+    const entry = plan.entries.find((candidate) => candidate.path.toLowerCase() === target.toLowerCase());
+    assert.ok(entry, `${target} is part of the plan`);
+    assert.equal(entry.kind, kindExpected);
     const { root, path: file, kind, size, mtime, sha256 } = entry;
     writeFileSync(path.join(stateDir, 'cleanup-evidence.json'), JSON.stringify({ origin_policy_id: policy,
       created_at: at.toISOString(),
       items: [{ root, path: file, kind, size, mtime, sha256, origin_released: true,
-        applied_proof: { kind: 'card_import_run', ref } }] }));
+        applied_proof: { kind: proofKind, ref } }] }));
     return planId;
   };
 
@@ -486,4 +489,40 @@ test('a card payload is released only by a successful import_runs row for its pr
   assert.equal(existsSync(payload), false);
   // SQLite 本体と WAL / SHM は触らない
   assert.equal(existsSync(fixture.cardDb), true);
+
+  // 月で名付けられた payload はその月を包含する成功実行でだけ解放される
+  const monthly = path.join(roots.card, 'data', 'import-smbc-2026-10.json');
+  writeFileSync(monthly, '{"messages":[]}');
+  // 11 は 10/05–10/20 しか覆わないので足りない。10 は 10/01–10/31 を覆う。
+  assert.throws(() => approveCleanup(stateDir, roots, approveWith('11', monthly), at, { includeLegacy: true }),
+    /INVALID_CLEANUP_EVIDENCE/, 'a run that does not span the whole month');
+  assert.equal(existsSync(monthly), true);
+  const monthlyPlan = approveWith('10', monthly);
+  assert.deepEqual(approveCleanup(stateDir, roots, monthlyPlan, at, { includeLegacy: true }), { scope: 'verified+legacy', legacy: 1 });
+  assert.equal(executeCleanup(stateDir, roots, monthlyPlan, at).removed_legacy, 1);
+  assert.equal(existsSync(monthly), false);
+
+  // 月別の取得ディレクトリ配下の本文と ids は card_staging_month で解放される
+  const staged = path.join(roots.card, 'data', 'gmail-staging', '2026', '2026-10', 'smbc');
+  mkdirSync(staged, { recursive: true });
+  const body = path.join(staged, 'messages.jsonl');
+  const ids = path.join(staged, 'ids.json');
+  writeFileSync(body, '{"id":"m1"}');
+  writeFileSync(ids, '["m1"]');
+  for (const [file, kind] of [[body, 'card_body'], [ids, 'ids']]) {
+    // その月を覆わない実行、別 provider、payload 向けの種別はいずれも承認されない
+    assert.throws(() => approveCleanup(stateDir, roots, approveWith('11', file, kind, 'card_staging_month'), at, { includeLegacy: true }),
+      /INVALID_CLEANUP_EVIDENCE/, `${kind} with a partial run`);
+    assert.throws(() => approveCleanup(stateDir, roots, approveWith('9', file, kind, 'card_staging_month'), at, { includeLegacy: true }),
+      /INVALID_CLEANUP_EVIDENCE/, `${kind} with another provider`);
+    assert.throws(() => approveCleanup(stateDir, roots, approveWith('10', file, kind), at, { includeLegacy: true }),
+      /INVALID_CLEANUP_EVIDENCE/, `${kind} with the payload proof kind`);
+  }
+  assert.equal(existsSync(body), true);
+  assert.equal(existsSync(ids), true);
+  const stagedPlan = approveWith('10', body, 'card_body', 'card_staging_month');
+  assert.deepEqual(approveCleanup(stateDir, roots, stagedPlan, at, { includeLegacy: true }), { scope: 'verified+legacy', legacy: 1 });
+  assert.equal(executeCleanup(stateDir, roots, stagedPlan, at).removed_legacy, 1);
+  assert.equal(existsSync(body), false);
+  assert.equal(existsSync(ids), true);
 });
