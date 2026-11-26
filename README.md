@@ -65,11 +65,13 @@ AI 経路からは解除できない。人が端末で実行する。
 
 `node run.mjs --cleanup-plan` で計画を作成し、ローカルの `state/cleanup-plans/<id>.json` を確認する。適用成功が証明できた対象を承認する場合は `node run.mjs --enable-cleanup --plan-id <id>`、同じ ID の実行は `node run.mjs --plan-id <id>` を使う。承認は一回限り。定常清掃を有効にする場合は、その後に人が `state/auto-cleanup-enabled` を配置する。
 
+計画出力の `excluded` には、清掃対象の種別に該当してもファイル検査で除外した件数をルート・種別・理由ごとに表示する。`multiple_hardlinks` があれば、非公開の計画で対象を確認する。
+
 ### 過去分の一括削除（方式 A）
 
 定常の照合済み台帳に記録が無い過去分は、別立ての証跡台帳 `state/cleanup-evidence.json` を人が用意し、`--include-legacy` を付けた承認の範囲内でだけ削除できます。台帳は新たに Gmail へ問い合わせず、ローカルの記録だけから作ります。
 
-- 先行条件は §10-10 の決定記録 `state/origin-policy.json`。この記録が無い、または台帳の `origin_policy_id` と一致しない間は過去分の削除件数が 0 のままになる。
+- Amazon の先行条件は §10-10 の決定記録 `state/origin-policy.json`。この記録が無い、または台帳の `origin_policy_id` と一致しない間は Amazon の過去分を削除できない。
 - 1 項目は計画の同一性フィールド（`root` / `path` / `kind` / `size` / `mtime` / `sha256`）の書き写しに `origin_released` と `applied_proof` を添える。`applied_proof.kind` は `amazon_backup`（当時のバックアップ CSV 名。対象の日付ディレクトリと世代日付が一致すること）、`amazon_run_log`（`gmail-import-rules.md` の実行日。その項目に書かれたバックアップが実在すること）、`card_import_run`（`import_runs` の行 ID。SQLite を読み取り専用で開き、成功・provider・期間が対象の payload 名と一致すること）のいずれか。
 - 未解決隔離、`parse-failures.json` を含むディレクトリ、`orders.csv`（`public` / `dist`）、SQLite 本体と WAL / SHM、`gmail-import-rules.md`、バックアップ CSV、復元セットは証跡があっても削除しない。
 - 承認時に全条件を検査し、削除の直前にも同じ条件と証跡台帳のハッシュを再検証する。承認後に差し替えられた項目と承認に無いパスは削除しない。承認は 1 回の実行で消費し、`cleanup-enabled`・計画台帳・証跡台帳を削除する。中断後の再開には再棚卸しと新規承認が必要。
@@ -82,4 +84,5 @@ AI 経路からは解除できない。人が端末で実行する。
 2. 本文・候補・ID・マニフェスト・隔離・解析失敗ファイルを対象に含める。年月別の過去取得と実行別の中間ディレクトリも確認する。
 3. 公式エクスポートの参照と再構築を先に試す。必要な入力が欠けていれば業務データ変更の前に中止する。変更前に復元セットを作り、処分対象にも登録する。
 4. 確定した取得元識別方針で Gmail 由来の Amazon 行を除去する。対応表のキーと一致する行だけを対象とし、`count` を超える一致は削除しない。対応表に無い行は原則残し、被覆報告の `unresolved`（2026-05-02 の差分 13 行）を削除側に寄せるかは人が決めて記録する。手順の完了後に対応表と決定記録自体も削除する。カード SQLite の独立データ有無を確認し、必要に応じて clean DB を再構築する。`email_messages`、`transaction_sources`、`gmail_fetch_messages`、`parse_failures`、`import_runs` の ID・診断欄と WAL / SHM も確認する。
-5. Gmail 由来のバックアップ・復元セット、`dist/data/orders.csv` と他の派生物を対象に含める。公式データを保持して再ビルドし、実施日時と対象別件数を記録する。
+5. Gmail 由来のバックアップ・復元セット、`dist/data/orders.csv` と他の派生物を対象に含める。公式データを保持して再ビルドする。
+6. 所有者が同期先の複製、版履歴、ごみ箱、共有先から復元可能な複製を確認する。バックアップ・復元セットは各世代を確認する。承認範囲で処分した後、ローカルと同期先の結果を件数で記録する。未確認や残存があればデータ処分は未完了とする。
