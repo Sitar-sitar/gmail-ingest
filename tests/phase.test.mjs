@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { approveCleanup, autoCleanup, createCleanupPlan, executeCleanup, retainVerifiedArtifacts } from '../lib/cleanup.mjs';
@@ -206,6 +206,30 @@ test('cleanup approval is single-use and changed, unverified and protected files
   retainVerifiedArtifacts(stateDir, roots, [{ root: 'amazon', file: second }], time);
   assert.equal(autoCleanup(stateDir, roots, time).removed, 1);
   assert.equal(existsSync(path.join(stateDir, 'auto-cleanup-enabled')), true);
+});
+
+test('cleanup planning explains hardlink exclusions without exposing paths in the result', async (t) => {
+  const { profile, roots, stateDir } = profileFixture(t);
+  const folder = path.join(roots.amazon, 'data', 'gmail-staging', 'amazon', '2026-01-01');
+  mkdirSync(folder, { recursive: true });
+  const file = path.join(folder, 'typeA-messages.jsonl');
+  writeFileSync(file, 'synthetic');
+  retainVerifiedArtifacts(stateDir, roots, [{ root: 'amazon', file }], time);
+  const alias = path.join(profile, 'sync-alias');
+  linkSync(file, alias);
+
+  const { exitCode, data } = await run(['--profile', profile, '--cleanup-plan'], { now: () => time });
+  assert.equal(exitCode, 0);
+  assert.deepEqual(data.excluded, { 'amazon:amazon_body:multiple_hardlinks': 1 });
+  assert.equal(data.eligible, 0);
+  assert.doesNotMatch(JSON.stringify(data), /messages\.jsonl|sync-alias/);
+  const plan = JSON.parse(readFileSync(path.join(stateDir, 'cleanup-plans', `${data.planId}.json`), 'utf8'));
+  assert.equal(plan.entries.some((entry) => entry.path === file), false);
+  assert.deepEqual(plan.excluded, [{ root: 'amazon', path: file, kind: 'amazon_body', reason: 'multiple_hardlinks' }]);
+  approveCleanup(stateDir, roots, data.planId, time);
+  assert.equal(executeCleanup(stateDir, roots, data.planId, time).removed, 0);
+  assert.equal(readFileSync(alias, 'utf8'), 'synthetic');
+  assert.equal(readFileSync(file, 'utf8'), 'synthetic');
 });
 
 test('WAL restore set includes all three verified members and rejects missing files', async (t) => {
