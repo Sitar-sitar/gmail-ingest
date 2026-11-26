@@ -2,7 +2,8 @@
 // Gmail へは問い合わせない。既定は dry-run で、--write を付けたときだけ台帳を書く。
 // 使い方: node tools/build-cleanup-evidence.mjs --plan-id <id> [--roots card,amazon] [--write]
 import { createRequire } from 'node:module';
-import { existsSync, lstatSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 const ROOTS = {
@@ -65,14 +66,65 @@ function cardProof(runs, entry) {
   return run ? { kind: 'card_import_run', ref: String(run.id) } : null;
 }
 
-function amazonProof(entry) {
-  const day = /\/gmail-staging\/amazon\/(\d{4}-\d{2}-\d{2})\//.exec(posix(entry.path))?.[1];
-  if (!day) return null;
-  const backups = path.join(ROOTS.amazon, 'backups', 'orders');
-  if (!existsSync(backups)) return null;
-  const match = readdirSync(backups).find((name) => name.startsWith(`${day}-`) && name.endsWith('.csv')
-    && lstatSync(path.join(backups, name)).isFile());
-  return match ? { kind: 'amazon_backup', ref: match } : null;
+const HASH = /^[a-f0-9]{64}$/;
+const DAY_KEY = /^\d{4}-\d{2}-\d{2}$/;
+const BACKUP_NAME = /^\d{4}-\d{2}-\d{2}-[A-Za-z0-9_-]+\.csv$/;
+
+function readAmazonPolicy(stateDir, entries) {
+  const file = path.join(stateDir, 'origin-policy.json');
+  if (!existsSync(file)) return { reason: 'origin_policy_missing' };
+  const mappingFile = path.join(ROOTS.amazon, 'data', 'gmail-origin.json');
+  try {
+    const { policy_id: id, ...record } = JSON.parse(readFileSync(file, 'utf8'));
+    const coverage = record.coverage;
+    const mappingRaw = readFileSync(mappingFile);
+    const mapping = JSON.parse(mappingRaw);
+    if (!HASH.test(id) || createHash('sha256').update(JSON.stringify(record)).digest('hex') !== id
+        || record.method !== 'mapping_table' || record.key_spec !== 'rowkeys_exact_v1'
+        || record.mapping_file !== 'amazon-tracker/data/gmail-origin.json' || mapping.key_spec !== record.key_spec
+        || coverage?.generated_at !== mapping.updated_at || !Array.isArray(coverage?.release_runs)
+        || !Array.isArray(coverage.unresolved)
+        || coverage.mapping_sha256 !== createHash('sha256').update(mappingRaw).digest('hex')) {
+      return { reason: 'origin_policy_invalid' };
+    }
+    const heldDates = new Set(coverage.unresolved.map((item) => item.baseline?.slice(0, 10)));
+    const releases = new Map();
+    const stage = path.join(ROOTS.amazon, 'data', 'gmail-staging', 'amazon');
+    for (const { baseline, staging_run: day, candidate_sha256: digest } of coverage.release_runs) {
+      if (!DAY_KEY.test(day) || !BACKUP_NAME.test(baseline) || baseline.slice(0, 10) !== day
+          || !HASH.test(digest) || releases.has(day) || heldDates.has(day)) {
+        return { reason: 'origin_policy_invalid' };
+      }
+      releases.set(day, { baseline, digest });
+    }
+    const matches = new Map();
+    const stagingNames = readdirSync(stage, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+    const backupDir = path.join(ROOTS.amazon, 'backups', 'orders');
+    const backupNames = readdirSync(backupDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && BACKUP_NAME.test(entry.name)).map((entry) => entry.name);
+    for (const [day, { baseline, digest }] of releases) {
+      const candidatePath = path.join(stage, day, 'candidates.json');
+      const candidate = entries.find((entry) => entry.root === 'amazon'
+        && path.relative(candidatePath, entry.path) === '' && entry.kind === 'candidate');
+      const sameDay = stagingNames.filter((name) => name.startsWith(day));
+      const sameDayBackups = backupNames.filter((name) => name.startsWith(`${day}-`));
+      if (sameDay.length === 1 && sameDay[0] === day && sameDayBackups.length === 1
+          && sameDayBackups[0] === baseline && candidate?.sha256 === digest && !candidate.parse_failure) {
+        matches.set(day, baseline);
+      }
+    }
+    return { id, matches };
+  } catch {
+    return { reason: 'origin_policy_invalid' };
+  }
+}
+
+function amazonProof(entry, policy) {
+  const target = posix(path.relative(ROOTS.amazon, entry.path));
+  const day = /^data\/gmail-staging\/amazon\/(\d{4}-\d{2}-\d{2})\/[^/]+$/.exec(target)?.[1];
+  const baseline = policy.matches.get(day);
+  return baseline ? { kind: 'amazon_backup', ref: baseline } : null;
 }
 
 const planId = arg('--plan-id');
@@ -83,17 +135,19 @@ if (selected.some((value) => !Object.hasOwn(ROOTS, value))) throw new Error('--r
 const stateDir = path.join(ROOTS.runner, 'state');
 const plan = JSON.parse(readFileSync(path.join(stateDir, 'cleanup-plans', `${planId}.json`), 'utf8'));
 const runs = selected.includes('card') ? successRuns() : [];
+const amazonPolicy = selected.includes('amazon') ? readAmazonPolicy(stateDir, plan.entries) : null;
 const items = [];
 const skipped = {};
 for (const entry of plan.entries) {
-  if (entry.verified !== false || entry.unresolved) continue;
+  if (entry.verified !== false || entry.unresolved || entry.parse_failure) continue;
   if (!selected.includes(entry.root)) { skipped[`${entry.root}:not_selected`] = (skipped[`${entry.root}:not_selected`] ?? 0) + 1; continue; }
   // 取得元識別 §5.7: 対応表が無い間は Amazon の成果物を取得元識別に不要と宣言できない。
-  if (entry.root === 'amazon' && !existsSync(path.join(stateDir, 'origin-policy.json'))) {
-    skipped['amazon:origin_policy_missing'] = (skipped['amazon:origin_policy_missing'] ?? 0) + 1;
+  if (entry.root === 'amazon' && amazonPolicy.reason) {
+    const key = `amazon:${amazonPolicy.reason}`;
+    skipped[key] = (skipped[key] ?? 0) + 1;
     continue;
   }
-  const proof = entry.root === 'card' ? cardProof(runs, entry) : entry.root === 'amazon' ? amazonProof(entry) : null;
+  const proof = entry.root === 'card' ? cardProof(runs, entry) : entry.root === 'amazon' ? amazonProof(entry, amazonPolicy) : null;
   if (!proof) { skipped[`${entry.root}:${entry.kind}:no_proof`] = (skipped[`${entry.root}:${entry.kind}:no_proof`] ?? 0) + 1; continue; }
   const { root, path: file, kind, size, mtime, sha256 } = entry;
   if (!Number.isFinite(mtime) || Date.now() - mtime < (RETENTION[kind] ?? 0) * DAY) {
@@ -106,7 +160,7 @@ for (const entry of plan.entries) {
 const byKind = {};
 for (const item of items) byKind[`${item.root}:${item.kind}`] = (byKind[`${item.root}:${item.kind}`] ?? 0) + 1;
 const bytes = items.reduce((sum, item) => sum + item.size, 0);
-const body = { origin_policy_id: '', created_at: new Date().toISOString(), items };
+const body = { origin_policy_id: amazonPolicy?.id ?? '', created_at: new Date().toISOString(), items };
 if (process.argv.includes('--write')) writeFileSync(path.join(stateDir, 'cleanup-evidence.json'), JSON.stringify(body, null, 2));
 // パス・ref は標準出力に出さない（件数と内訳だけを出す）。
 process.stdout.write(`${JSON.stringify({ plan_id: planId, roots: selected, written: process.argv.includes('--write'),

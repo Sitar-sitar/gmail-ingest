@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { existsSync, linkSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, linkSync, mkdirSync, readFileSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { test } from 'node:test';
 import { approveCleanup, autoCleanup, createCleanupPlan, executeCleanup, retainVerifiedArtifacts } from '../lib/cleanup.mjs';
@@ -230,6 +231,51 @@ test('cleanup planning explains hardlink exclusions without exposing paths in th
   assert.equal(executeCleanup(stateDir, roots, data.planId, time).removed, 0);
   assert.equal(readFileSync(alias, 'utf8'), 'synthetic');
   assert.equal(readFileSync(file, 'utf8'), 'synthetic');
+});
+
+test('Amazon evidence requires the bound mapping and a unique covered staging run', (t) => {
+  const { roots, stateDir } = profileFixture(t);
+  const script = path.join(roots.runner, 'tools', 'build-cleanup-evidence.mjs');
+  const backupDir = path.join(roots.amazon, 'backups', 'orders');
+  const stage = path.join(roots.amazon, 'data', 'gmail-staging', 'amazon');
+  const day = '2026-10-01';
+  const baseline = `${day}-090000-orders.csv`;
+  for (const dir of [path.dirname(script), backupDir, path.join(stage, day)]) mkdirSync(dir, { recursive: true });
+  copyFileSync(new URL('../tools/build-cleanup-evidence.mjs', import.meta.url), script);
+  writeFileSync(path.join(backupDir, baseline), 'synthetic CSV');
+  const candidate = path.join(stage, day, 'candidates.json');
+  writeFileSync(candidate, '{"rows":[]}');
+  utimesSync(candidate, new Date('2026-10-02'), new Date('2026-10-02'));
+  const sha = (value) => createHash('sha256').update(value).digest('hex');
+  const at = time.toISOString();
+  const mapping = JSON.stringify({ version: 1, key_spec: 'rowkeys_exact_v1', updated_at: at, entries: [] });
+  const mappingPath = path.join(roots.amazon, 'data', 'gmail-origin.json');
+  writeFileSync(mappingPath, mapping);
+  const body = { decided_at: at, method: 'mapping_table', mapping_file: 'amazon-tracker/data/gmail-origin.json',
+    key_spec: 'rowkeys_exact_v1', coverage: { generated_at: at, unresolved: [], mapping_sha256: sha(mapping),
+      release_runs: [{ staging_run: day, baseline, candidate_sha256: sha(readFileSync(candidate)) }] } };
+  const policyId = sha(JSON.stringify(body));
+  const policyPath = path.join(stateDir, 'origin-policy.json');
+  writeFileSync(policyPath, JSON.stringify({ policy_id: policyId, ...body }));
+  const { planId } = createCleanupPlan(stateDir, roots, time);
+  const generate = (...args) => {
+    const result = spawnSync(process.execPath, [script, '--plan-id', planId, '--roots', 'amazon', ...args], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, new RegExp(policyId));
+    return JSON.parse(result.stdout);
+  };
+  assert.equal(generate('--write').items, 1);
+  const evidence = JSON.parse(readFileSync(path.join(stateDir, 'cleanup-evidence.json'), 'utf8'));
+  assert.equal(evidence.origin_policy_id, policyId);
+  assert.equal(evidence.items[0].applied_proof.ref, baseline);
+  writeFileSync(mappingPath, mapping + '\n');
+  assert.equal(generate().skipped['amazon:origin_policy_invalid'], 1);
+  writeFileSync(mappingPath, mapping);
+  mkdirSync(path.join(stage, `${day}-rerun1`));
+  assert.equal(generate().skipped['amazon:candidate:no_proof'], 1);
+  body.coverage.unresolved = [{ baseline }];
+  writeFileSync(policyPath, JSON.stringify({ policy_id: sha(JSON.stringify(body)), ...body }));
+  assert.equal(generate().skipped['amazon:origin_policy_invalid'], 1);
 });
 
 test('WAL restore set includes all three verified members and rejects missing files', async (t) => {
