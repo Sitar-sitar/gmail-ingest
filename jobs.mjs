@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, lstatSync } from 'node:fs';
 import path from 'node:path';
 import { AMAZON_TYPES, CARD_PROVIDERS, cardRange, jstDayStartSeconds, offsetDay, targetState } from './lib/state.mjs';
-import { expectAmazonRows, readJsonLines, strictIds, verifyAmazonApplied, verifyAmazonSource, verifyCardSets, VerificationError } from './lib/verify.mjs';
+import { expectAmazonRows, readJsonLines, strictIds, verifyAmazonApplied, verifyAmazonSource, verifyCardSets, verifyOriginMapping, VerificationError } from './lib/verify.mjs';
 
 function verifiedFile(root, file) {
   if (!path.isAbsolute(file)) throw new VerificationError();
@@ -88,42 +88,77 @@ export async function executeCard({ step, paths, provider, range, state }) {
   };
 }
 
-export async function executeAmazon({ step, paths, ranges, today, idsOnly = false }) {
+// 状態の型名と Amazon CLI の型名の対応（§5.2-1）。
+const AMAZON_TYPE_CLI = Object.freeze({ type_a: 'typeA', type_b: 'typeB' });
+
+function attributeParseFailure(out, selected) {
+  // 型に帰属できる取得・解析失敗は当該型だけに記録し、他の選択型は据え置く（§5.2-1）。
+  const generic = { outcome: 'permanent', code: 'parse' };
+  if (selected.length < 2) return generic;
+  let issues;
+  try { issues = readJson(path.join(out, 'parse-failures.json')).issues; }
+  catch { return generic; }
+  if (!Array.isArray(issues) || !issues.length) return generic;
+  const culprits = new Set(issues.map(({ type }) => Object.keys(AMAZON_TYPE_CLI)
+    .find((key) => AMAZON_TYPE_CLI[key] === type)));
+  if (culprits.has(undefined) || culprits.size !== 1) return generic;
+  const [culprit] = culprits;
+  if (!selected.includes(culprit)) return generic;
+  return { ...generic, byTarget: Object.fromEntries(selected.map((type) => [type,
+    type === culprit ? { outcome: 'permanent', code: 'parse' } : { outcome: 'not_run', code: 'parse' }])) };
+}
+
+export async function executeAmazon({ step, paths, ranges, today, idsOnly = false, selected = AMAZON_TYPES }) {
   const staging = path.join(paths.amazonRoot, 'data', 'gmail-staging', 'amazon');
   mkdirSync(staging, { recursive: true });
   const out = path.join(staging, today, `run-${randomUUID()}`);
   mkdirSync(out, { recursive: true });
+  // 検索専用モードは既存の両型契約を継承する（§5.2-1）。
+  const types = idsOnly ? [...AMAZON_TYPES] : AMAZON_TYPES.filter((type) => selected.includes(type));
+  if (!types.length) throw new VerificationError();
   const rangeStart = (type) => jstDayStartSeconds(ranges[type]?.from ?? today) - 1;
-  const dates = { typeA: rangeStart('type_a'), typeB: rangeStart('type_b') };
+  const dates = Object.fromEntries(types.map((type) => [AMAZON_TYPE_CLI[type], rangeStart(type)]));
   const fetched = await step('amazon', 'gmail-fetch-local.mjs', [
-    '--type-a-after', String(dates.typeA), '--type-b-after', String(dates.typeB),
-    '--auth-file', paths.authFile, '--out', out, '--ingest-status', ...(idsOnly ? ['--ids-only'] : []),
+    ...(types.includes('type_a') ? ['--type-a-after', String(dates.typeA)] : []),
+    ...(types.includes('type_b') ? ['--type-b-after', String(dates.typeB)] : []),
+    '--auth-file', paths.authFile, '--out', out, '--ingest-status',
+    ...(idsOnly ? ['--ids-only'] : ['--types', types.map((type) => AMAZON_TYPE_CLI[type]).join(',')]),
   ]);
   if (!fetched.treeStopped || fetched.exitCode === 3) return failed(fetched);
-  if (existsSync(path.join(out, 'parse-failures.json'))) return { outcome: 'permanent', code: 'parse' };
+  if (existsSync(path.join(out, 'parse-failures.json'))) return attributeParseFailure(out, types);
   if (fetched.exitCode !== 0 || fetched.failure) return failed(fetched);
   if (fetched.result?.ok !== true || fetched.result.ids_only !== idsOnly) throw new VerificationError();
   if (idsOnly) return { outcome: 'success', counts: { searched: fetched.result.typeA?.id_count + fetched.result.typeB?.id_count } };
+  const selectedCli = types.map((type) => AMAZON_TYPE_CLI[type]);
+  if (JSON.stringify(fetched.result.selected_types) !== JSON.stringify(selectedCli)) throw new VerificationError();
 
   const candidatesFile = verifiedFile(out, path.join(out, 'candidates.json'));
   const candidates = readJson(candidatesFile);
   const messageFiles = [];
   const sources = {};
-  for (const [type, after] of Object.entries(dates)) {
-    const idsFile = verifiedFile(out, path.join(out, `${type}-ids.json`));
+  for (const type of Object.values(AMAZON_TYPE_CLI)) {
+    const idsPath = path.join(out, `${type}-ids.json`);
     const messagesFile = path.join(out, `${type}-messages.jsonl`);
+    if (!selectedCli.includes(type)) {
+      sources[type] = { selected: false, files: [idsPath, messagesFile] };
+      continue;
+    }
+    const idsFile = verifiedFile(out, idsPath);
     const ids = readJson(idsFile);
     const messages = existsSync(messagesFile) ? readJsonLines(verifiedFile(out, messagesFile)) : [];
-    sources[type] = { after, ids, messages };
+    sources[type] = { selected: true, after: dates[type], ids, messages };
     messageFiles.push(idsFile);
     if (existsSync(messagesFile)) messageFiles.push(messagesFile);
   }
-  verifyAmazonSource(candidates, sources);
+  verifyAmazonSource(candidates, sources, selectedCli);
   const before = readFileSync(paths.ordersCsv, 'utf8');
   const proofs = path.join(staging, 'verified-summary-rows.json');
   const proof = existsSync(proofs) ? readJson(verifiedFile(staging, proofs)) : [];
   if (!Array.isArray(proof) || !proof.every((value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value))) throw new VerificationError();
   const expected = expectAmazonRows(before, candidates, proof);
+  // 取得元識別 §5.4: 適用前後の対応表を読み、期待した加減算と一致するか検算する。
+  const originFile = paths.originMapping;
+  const originBefore = existsSync(originFile) ? readFileSync(originFile, 'utf8') : null;
   const isolated = path.join(out, 'isolated.json');
   const applied = await step('amazon', 'gmail-import-run.mjs', [
     '--candidates-file', candidatesFile, '--isolated-out', isolated, ...(proof.length ? ['--summary-proof', proofs] : []),
@@ -131,6 +166,8 @@ export async function executeAmazon({ step, paths, ranges, today, idsOnly = fals
   if (applied.exitCode !== 0 || applied.failure) return failed(applied);
   const stats = applied.result;
   if (stats?.isolated_file !== isolated) throw new VerificationError();
+  verifyOriginMapping({ header: expected.header, expected, beforeText: originBefore,
+    afterText: existsSync(originFile) ? readFileSync(originFile, 'utf8') : '', stats });
   verifyAmazonApplied({ expected, csvBefore: before, csvAfter: readFileSync(paths.ordersCsv, 'utf8'),
     backup: readFileSync(verifiedFile(path.join(paths.amazonRoot, 'backups', 'orders'), stats.backup?.path ?? ''), 'utf8'),
     isolation: readJson(verifiedFile(out, isolated)), stats, candidateCount: candidates.rows.length });

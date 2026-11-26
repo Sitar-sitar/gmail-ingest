@@ -17,7 +17,8 @@ function fixture(t) {
     mkdirSync(path.dirname(file), { recursive: true });
     writeFileSync(file, 'synthetic fixture');
   }
-  return { amazonRoot, cardRoot, authFile, ordersCsv, cardDb };
+  return { amazonRoot, cardRoot, authFile, ordersCsv, cardDb,
+    originMapping: path.join(amazonRoot, 'data', 'gmail-origin.json') };
 }
 
 test('sets fixed destinations and only allows the explicit child environment', (t) => {
@@ -28,13 +29,14 @@ test('sets fixed destinations and only allows the explicit child environment', (
     'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN', 'GOOGLE_GMAIL_AUTH_FILE',
     'AMZ_GMAIL_IMPORT_CANDIDATES_FILE', 'AMZ_GMAIL_IMPORT_ISOLATED_FILE', 'NODE_OPTIONS',
     'GMAIL_AUTH_FILE', 'GMAIL_INGEST_LOCK_TOKEN', 'AMZ_GMAIL_IMPORT_ORDERS_CSV', 'CREDIT_CARD_DB_PATH',
+    'AMZ_GMAIL_ORIGIN_FILE',
   ].map((name) => [name, 'synthetic override']));
   parentEnv.Path = 'synthetic path';
   parentEnv.SYSTEMROOT = 'synthetic system root';
   assert.deepEqual(buildChildEnv(files, { parentEnv, lockToken: 'local owner' }), {
     PATH: 'synthetic path', SystemRoot: 'synthetic system root', GMAIL_AUTH_FILE: files.authFile,
-    AMZ_GMAIL_IMPORT_ORDERS_CSV: files.ordersCsv, CREDIT_CARD_DB_PATH: files.cardDb,
-    GMAIL_INGEST_LOCK_TOKEN: 'local owner',
+    AMZ_GMAIL_IMPORT_ORDERS_CSV: files.ordersCsv, AMZ_GMAIL_ORIGIN_FILE: files.originMapping,
+    CREDIT_CARD_DB_PATH: files.cardDb, GMAIL_INGEST_LOCK_TOKEN: 'local owner',
   });
 });
 

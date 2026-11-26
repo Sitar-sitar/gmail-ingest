@@ -24,12 +24,12 @@ export function optionsFrom(args) {
     'expected-account-fingerprint': { type: 'string' }, 'cleanup-plan': { type: 'boolean' },
     'enable-cleanup': { type: 'boolean' }, 'plan-id': { type: 'string' },
     'restore-set': { type: 'boolean' }, 'ids-only': { type: 'boolean' }, 'test-weekly': { type: 'boolean' },
-    'include-legacy-state': { type: 'boolean' },
+    'include-legacy-state': { type: 'boolean' }, 'include-legacy': { type: 'boolean' },
   } });
   if (new Set(tokens.map(({ name }) => name)).size !== tokens.length) throw new Error('INVALID_MODE');
   const { job, profile, 'gap-only': gapOnly, 'clear-failure': clearFailure, 'plan-id': planId,
     'expected-account-fingerprint': expectedFingerprint, 'ids-only': idsOnly, 'test-weekly': testWeekly,
-    'include-legacy-state': includeLegacy } = values;
+    'include-legacy-state': includeLegacyState, 'include-legacy': includeLegacy } = values;
   const modes = [clearFailure && 'clear', values['register-account'] && 'account', values['cleanup-plan'] && 'plan',
     values['enable-cleanup'] && 'approve', values['restore-set'] && 'restore', planId && !values['enable-cleanup'] && 'cleanup'].filter(Boolean);
   const mode = modes[0] ?? 'import';
@@ -40,8 +40,10 @@ export function optionsFrom(args) {
       (mode === 'account' ? !HASH.test(expectedFingerprint ?? '') : Boolean(expectedFingerprint)) ||
       ((mode === 'approve' || mode === 'cleanup') && !HASH.test(planId ?? '')) ||
       (testWeekly && (!profile || mode !== 'import' || job || gapOnly || idsOnly)) ||
-      (includeLegacy && mode !== 'restore')) throw new Error('INVALID_MODE');
-  return { mode, job, profile, gapOnly, clearFailure, expectedFingerprint, idsOnly, planId, testWeekly, includeLegacy };
+      // 名前の近い2つの範囲フラグは、ここだけで可否を決める（§5.1-2）。
+      (includeLegacyState && mode !== 'restore') || (includeLegacy && mode !== 'approve')) throw new Error('INVALID_MODE');
+  return { mode, job, profile, gapOnly, clearFailure, expectedFingerprint, idsOnly, planId, testWeekly,
+    includeLegacyState, includeLegacy };
 }
 
 function underneath(parent, child) {
@@ -73,7 +75,9 @@ function validateOutputs(config, checkAuth) {
   for (const output of [stateDir, stateFile, logDir, path.join(roots.runner, 'data', 'gmail-auth'),
     ...Object.values(lockFiles), path.join(stateDir, 'restore-sets'), path.join(stateDir, 'cleanup-plans'),
     path.join(stateDir, 'verified-artifacts.json'), path.join(stateDir, 'auto-cleanup-enabled'), path.join(stateDir, 'cleanup-enabled'),
+    path.join(stateDir, 'cleanup-evidence.json'), path.join(stateDir, 'origin-policy.json'),
     path.join(roots.amazon, 'backups', 'orders'), path.join(roots.amazon, 'data', 'gmail-staging', 'amazon'),
+    path.join(roots.amazon, 'data', 'gmail-origin.json'),
     path.join(roots.card, 'data', 'gmail-staging'), path.join(roots.card, 'data', 'credit-card.db-wal'),
     path.join(roots.card, 'data', 'credit-card.db-shm'), path.join(roots.card, 'quarantine', 'gmail-import'),
     path.join(roots.card, 'logs', 'gmail-import')]) assertUnredirected(output);
@@ -162,7 +166,7 @@ export async function run(args, { now = () => new Date(), spawnStep = runNodeSte
       return 0;
     }
     if (options.mode === 'approve') {
-      approveCleanup(stateDir, options.planId, start);
+      data = approveCleanup(stateDir, roots, options.planId, start, { includeLegacy: options.includeLegacy });
       return 0;
     }
     if (options.mode === 'cleanup' || options.mode === 'restore') {
@@ -170,7 +174,7 @@ export async function run(args, { now = () => new Date(), spawnStep = runNodeSte
       acquire('credit-card');
       data = options.mode === 'cleanup' ? executeCleanup(stateDir, roots, options.planId, start)
         : await createRestoreSet({ ...paths, stateDir, stateFile, at: start, lockHeld: { amazon: true, card: true },
-          legacyFiles: options.includeLegacy ? legacyFiles(roots) : [] });
+          legacyFiles: options.includeLegacyState ? legacyFiles(roots) : [] });
       return 0;
     }
     const state = loadState(stateFile);
@@ -182,12 +186,18 @@ export async function run(args, { now = () => new Date(), spawnStep = runNodeSte
     if (slot && state.last_run.completed_slot >= slot) return 0;
 
     const jobs = listJobs(state, options, today).filter(({ ranges }) => Object.values(ranges).some(Boolean) || options.idsOnly);
-    const available = jobs.filter(({ job, targets }) => {
+    // 範囲があり未承認のブロックでもない対象だけを実行する（§5.2-1）。
+    const available = [];
+    let skipped = 0;
+    for (const spec of jobs) {
+      const { job, targets, ranges } = spec;
       const blocked = targets.filter((provider) => isBlocked(state, job, provider));
       for (const provider of blocked) entries.push({ job, provider, step: 'prepare', outcome: 'permanent',
         failure_id: targetState(state, job, provider).failure.failure_id, checks: { skipped: true } });
-      return options.idsOnly || blocked.length === 0;
-    });
+      const runnable = targets.filter((provider) => ranges[provider] && !blocked.includes(provider));
+      skipped += targets.filter((provider) => ranges[provider] && blocked.includes(provider)).length;
+      if (options.idsOnly || runnable.length > 0) available.push({ ...spec, runnable });
+    }
     if (options.mode === 'import' && jobs.length && !available.length) return 5;
     if (options.mode === 'import' && !available.length) return 0;
     if (options.mode === 'import' && !options.idsOnly) {
@@ -215,10 +225,10 @@ export async function run(args, { now = () => new Date(), spawnStep = runNodeSte
     const deadlines = new Map();
     let resultCode = 0;
     for (const spec of available) {
-      const { job, targets, ranges } = spec;
+      const { job, targets, ranges, runnable } = spec;
       if (!deadlines.has(job)) deadlines.set(job, uptime() + 45 * MINUTE);
       const deadline = Math.min(runDeadline, deadlines.get(job));
-      const pending = targets.filter((provider) => ranges[provider]);
+      const pending = options.idsOnly ? targets.filter((provider) => ranges[provider]) : runnable;
       for (const provider of pending) {
         if (consumeFailureApproval(state, job, provider)) saveState(stateFile, state);
       }
@@ -228,7 +238,8 @@ export async function run(args, { now = () => new Date(), spawnStep = runNodeSte
       for (const delay of [60_000, 300_000, null]) {
         try {
           result = await execute({ paths, step: stepFor(deadline), ranges, today, idsOnly: options.idsOnly,
-            provider: targets[0], range: ranges[targets[0]], state });
+            selected: runnable, provider: runnable[0] ?? targets[0],
+            range: ranges[runnable[0] ?? targets[0]], state });
         } catch (error) {
           if (error instanceof ImportLockError || retained.size) result = { outcome: 'not_run', locked: true, code: 'lock' };
           else if (error instanceof VerificationError || error instanceof SyntaxError || error.code === 'ENOENT') {
@@ -244,13 +255,15 @@ export async function run(args, { now = () => new Date(), spawnStep = runNodeSte
       const code = classifyExit(result);
       const combinedAmazon = job === 'amazon' && !options.idsOnly;
       for (const provider of options.idsOnly ? [] : pending) {
+        // 型に帰属できる失敗は byTarget で対象ごとに分かれる（§5.2-1）。
+        const share = result.byTarget?.[provider] ?? result;
         const prior = targetState(state, job, provider).confirmed_through;
         if (code !== 3) {
-          recordTarget(state, job, provider, { outcome: result.outcome, code: result.code, range: ranges[provider],
-            verifiedThrough: result.verified ? ranges[provider].to : '', at: start });
+          recordTarget(state, job, provider, { outcome: share.outcome, code: share.code, range: ranges[provider],
+            verifiedThrough: share.verified ?? result.verified ? ranges[provider].to : '', at: start });
         }
         const next = targetState(state, job, provider);
-        entries.push({ job, provider, step: 'verify', retries, outcome: result.outcome, code: result.code,
+        entries.push({ job, provider, step: 'verify', retries, outcome: share.outcome, code: share.code,
           http_status: result.httpStatus, failure_id: next.failure?.failure_id,
           confirmed_before: prior, confirmed_after: next.confirmed_through, counts: combinedAmazon ? undefined : result.counts });
       }
@@ -267,7 +280,8 @@ export async function run(args, { now = () => new Date(), spawnStep = runNodeSte
     }
     if (!options.idsOnly) {
       if (slot) {
-        const completed = resultCode === 0 && available.length === jobs.length ? slot : state.last_run.completed_slot;
+        // 予定していた対象を1つでも見送った回は枠を未完了のまま残す（§5.2-1）。
+        const completed = resultCode === 0 && skipped === 0 ? slot : state.last_run.completed_slot;
         state.last_run = { started_at: start.toISOString(), finished_at: now().toISOString(),
           exit_code: resultCode, attempted_slot: slot, completed_slot: completed };
         saveState(stateFile, state);
