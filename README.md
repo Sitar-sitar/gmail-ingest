@@ -61,7 +61,7 @@ AI 経路からは解除できない。人が端末で実行する。
 
 ## 保存期限と権限取り消し
 
-2026-11-25 のユーザー判断で、取得元識別に使う元データを保持しています。一括削除と定常の自動削除は保留中です。
+取得元識別に必要な中間資料は保持します。方式 A の一括削除は2026-11-26にカード・Amazonで実施し、照合済み台帳を使う定常清掃を有効にしました。
 
 `node run.mjs --cleanup-plan` で計画を作成し、ローカルの `state/cleanup-plans/<id>.json` を確認する。適用成功が証明できた対象を承認する場合は `node run.mjs --enable-cleanup --plan-id <id>`、同じ ID の実行は `node run.mjs --plan-id <id>` を使う。承認は一回限り。定常清掃を有効にする場合は、その後に人が `state/auto-cleanup-enabled` を配置する。
 
@@ -72,6 +72,7 @@ AI 経路からは解除できない。人が端末で実行する。
 定常の照合済み台帳に記録が無い過去分は、別立ての証跡台帳 `state/cleanup-evidence.json` を人が用意し、`--include-legacy` を付けた承認の範囲内でだけ削除できます。台帳は新たに Gmail へ問い合わせず、ローカルの記録だけから作ります。
 
 - Amazon の先行条件は §10-10 の決定記録 `state/origin-policy.json`。この記録が無い、または台帳の `origin_policy_id` と一致しない間は Amazon の過去分を削除できない。
+- Amazon の証跡には正式適用時の被覆と、候補・バックアップ・ステージングの一意な対応を求める。決定記録の作成と被覆報告の形式は取得元識別の修正設計 §5.1 を参照する。
 - 1 項目は計画の同一性フィールド（`root` / `path` / `kind` / `size` / `mtime` / `sha256`）の書き写しに `origin_released` と `applied_proof` を添える。`applied_proof.kind` は `amazon_backup`（当時のバックアップ CSV 名。対象の日付ディレクトリと世代日付が一致すること）、`amazon_run_log`（`gmail-import-rules.md` の実行日。その項目に書かれたバックアップが実在すること）、`card_import_run`（`import_runs` の行 ID。SQLite を読み取り専用で開き、成功・provider・期間が対象の payload 名と一致すること）のいずれか。
 - 未解決隔離、`parse-failures.json` を含むディレクトリ、`orders.csv`（`public` / `dist`）、SQLite 本体と WAL / SHM、`gmail-import-rules.md`、バックアップ CSV、復元セットは証跡があっても削除しない。
 - 承認時に全条件を検査し、削除の直前にも同じ条件と証跡台帳のハッシュを再検証する。承認後に差し替えられた項目と承認に無いパスは削除しない。承認は 1 回の実行で消費し、`cleanup-enabled`・計画台帳・証跡台帳を削除する。中断後の再開には再棚卸しと新規承認が必要。
